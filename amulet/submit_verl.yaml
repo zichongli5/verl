@@ -1,0 +1,61 @@
+description: pretrain transformer model
+ 
+target:
+  name: GenAI-Shared-UKSouth2
+  workspace_name: Singularity-GenAI-WS-UKSouth2
+  service: sing
+
+environment:
+
+  #image: h100-nvidia23.10-pytorch2.1.1-cuda12.2.2-deepspeed0.12.3-flashattn2.5.2:v0.1
+  # image: customized_nvcr:samba_public
+  image: customized_nvcr:vllm_0150_verl_060
+  username: 44359f3e6e864ddba0853a221be97722
+  registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
+  setup:
+    - set -e -o xtrace
+    - export PIP_CONSTRAINT=""
+    - pip list
+    - export PATH="$$PATH:/home/aiscuser/.local/bin"
+
+storage:
+  model_storage:
+    storage_account_name: tsinterns
+    container_name: t-zichongli
+    mount_dir: /mnt/main_storage
+    is_output: true
+ 
+code:
+  # local directory of the code. this will be uploaded to the server.
+  # $CONFIG_DIR is expanded to the directory of this config file
+  local_dir: $CONFIG_DIR/../
+ 
+
+
+jobs:
+  - name: dapo-qwen2p5-7b-base
+    sku: 1x80G8-A100
+    sla_tier: standard
+    priority: high
+    process_count_per_node: 1
+    mpi: false
+    command:
+      - sudo wandb login $${WANDB_API_KEY}
+      - export PATH="$$PATH:/home/aiscuser/.local/bin"
+      - pip install --no-deps -e .
+      - bash recipe/zli/run_dapo_qwen2.5_7b_base.sh
+    submit_args:
+      env:
+        NCCL_IB_DISABLE: 0
+        NCCL_DEBUG: INFO
+        NCCL_IB_TIMEOUT: 22
+        MKL_THREADING_LAYER: GNU
+        AMLT_NO_TENSORBOARD_PATCHING: 1
+        DISABLE_ADDMM_CUDA_LT: 1
+        DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
+        RAY_ADDRESS: "http://127.0.0.1:8265"
+        RUNTIME_ENV: "./recipe/dapo/runtime_env.yaml"
+        RAY_DATA_HOME: "/mnt/main_storage/qerl"
+        NNODES: "1"
+        _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/d676d072-7cbf-4197-b2d6-17ecf38370d0/resourceGroups/Singularity-GenAI-GPU-UKSouth2/providers/Microsoft.ManagedIdentity/userAssignedIdentities/genai-sing-uai2
+        WANDB_PROJECT: "QeRL"

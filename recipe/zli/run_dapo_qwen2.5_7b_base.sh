@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-32B'
+exp_name='DAPO-Qwen2.5-7B-Base'
 
 adv_estimator=grpo
 
@@ -25,21 +25,21 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=512
+train_prompt_bsz=16
 gen_prompt_bsz=$((train_prompt_bsz * 3))
 n_resp_per_prompt=16
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=1
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-16}
+NNODES=${NNODES:-1}
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-32B"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"/mnt/main_storage/qerl"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Algorithm
@@ -49,12 +49,12 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=8
+sp_size=4
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
-infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 offload=True
-gen_tp=4
+gen_tp=1
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
