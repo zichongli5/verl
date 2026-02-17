@@ -63,6 +63,15 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.model import convert_weight_keys
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.qlora import (
+    attach_weight_proxies_for_qlora,
+    get_quantization_model_init_kwargs,
+    is_missing_weight_attr_error,
+    is_peft_lora_injection_error,
+    is_qlora_mode,
+    is_quantized_model_config,
+    maybe_prepare_model_for_qlora,
+)
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
@@ -119,7 +128,8 @@ class FSDPEngine(BaseEngine):
         # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
-        self._is_lora = self.model_config.lora_rank > 0
+        self._is_lora = self.model_config.lora_rank > 0 or self.model_config.lora_adapter_path is not None
+        self._is_qlora = is_qlora_mode(self._is_lora, self.model_config.hf_config)
 
         if self.engine_config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
@@ -202,12 +212,15 @@ class FSDPEngine(BaseEngine):
             warnings.simplefilter("ignore")
 
             auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
+            quantized_model_init_kwargs = get_quantization_model_init_kwargs(self.model_config.hf_config)
+            is_quantized_model = is_quantized_model_config(self.model_config.hf_config)
 
             module = auto_class.from_pretrained(
                 pretrained_model_name_or_path=self.model_config.local_path,
                 torch_dtype=torch_dtype,
                 config=self.model_config.hf_config,
                 trust_remote_code=self.model_config.trust_remote_code,
+                **quantized_model_init_kwargs,
             )
 
             use_liger = self.model_config.use_liger
@@ -231,14 +244,29 @@ class FSDPEngine(BaseEngine):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
-            # some parameters may not in torch_dtype
-            module.to(torch_dtype)
+            # Preserve quantized weights when loading quantized checkpoints.
+            if not is_quantized_model:
+                # some parameters may not in torch_dtype
+                module.to(torch_dtype)
+            elif self.rank == 0:
+                print(f"Detected quantized model. Skipping module.to({torch_dtype}).")
 
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return module
 
     def _build_lora_module(self, module):
+        if self._is_qlora:
+            module, used_prepare_kbit = maybe_prepare_model_for_qlora(
+                module,
+                enable_gradient_checkpointing=self.model_config.enable_gradient_checkpointing,
+                logger=logger,
+            )
+            if used_prepare_kbit and self.rank == 0:
+                print("Applied `prepare_model_for_kbit_training` for engine module.")
+            patched = attach_weight_proxies_for_qlora(module, logger=logger)
+            if patched > 0 and self.rank == 0:
+                print(f"Attached weight proxies for {patched} modules before PEFT injection (engine).")
         module.enable_input_require_grads()
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
@@ -251,7 +279,22 @@ class FSDPEngine(BaseEngine):
             # Copy adapter to local if needed
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
-            module = PeftModel.from_pretrained(module, local_adapter_path, is_trainable=True)
+            try:
+                module = PeftModel.from_pretrained(module, local_adapter_path, is_trainable=True)
+            except Exception as exc:
+                recovered = False
+                if self._is_qlora and is_missing_weight_attr_error(exc):
+                    patched = attach_weight_proxies_for_qlora(module, logger=logger)
+                    if patched > 0:
+                        module = PeftModel.from_pretrained(module, local_adapter_path, is_trainable=True)
+                        recovered = True
+                if not recovered:
+                    if self._is_qlora and is_peft_lora_injection_error(exc):
+                        raise RuntimeError(
+                            "Failed to inject LoRA adapter into quantized base model. "
+                            "This usually means PEFT does not support the checkpoint's quantized linear class."
+                        ) from exc
+                    raise
             peft_config = module.peft_config["default"]
             # Ensure task_type is TaskType enum, not string
             if isinstance(peft_config.task_type, str):
@@ -266,7 +309,22 @@ class FSDPEngine(BaseEngine):
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
                 "bias": "none",
             }
-            module = get_peft_model(module, LoraConfig(**lora_config))
+            try:
+                module = get_peft_model(module, LoraConfig(**lora_config))
+            except Exception as exc:
+                recovered = False
+                if self._is_qlora and is_missing_weight_attr_error(exc):
+                    patched = attach_weight_proxies_for_qlora(module, logger=logger)
+                    if patched > 0:
+                        module = get_peft_model(module, LoraConfig(**lora_config))
+                        recovered = True
+                if not recovered:
+                    if self._is_qlora and is_peft_lora_injection_error(exc):
+                        raise RuntimeError(
+                            "Failed to apply LoRA on quantized base model. "
+                            "This usually means PEFT does not support the checkpoint's quantized linear class."
+                        ) from exc
+                    raise
 
         return module
 
@@ -291,7 +349,7 @@ class FSDPEngine(BaseEngine):
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=module,
             config=self.engine_config.wrap_policy,
-            is_lora=self.model_config.lora_rank > 0,
+            is_lora=self._is_lora,
         )
 
         fsdp_mesh = self.device_mesh

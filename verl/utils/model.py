@@ -616,8 +616,11 @@ def patch_valuehead_model(model) -> None:
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
 
-def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code, model_init_kwargs=None):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+
+    if model_init_kwargs is None:
+        model_init_kwargs = {}
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -626,6 +629,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
             config=model_config,
             attn_implementation="flash_attention_2",
             trust_remote_code=trust_remote_code,
+            **model_init_kwargs,
         )
         return model
     except BaseException as e:
@@ -648,6 +652,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         config=model_config,
         attn_implementation="flash_attention_2",
         trust_remote_code=trust_remote_code,
+        **model_init_kwargs,
     )
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)

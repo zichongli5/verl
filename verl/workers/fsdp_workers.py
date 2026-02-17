@@ -84,6 +84,16 @@ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.qlora import (
+    attach_weight_proxies_for_qlora,
+    get_quantization_model_init_kwargs,
+    is_missing_weight_attr_error,
+    is_peft_lora_injection_error,
+    is_qlora_mode,
+    is_quantized_model_config,
+    maybe_prepare_model_for_qlora,
+    validate_rollout_load_format_for_qlora,
+)
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
@@ -180,6 +190,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
+        self._is_qlora = False
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -341,6 +352,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
+        quantized_model_init_kwargs = get_quantization_model_init_kwargs(actor_model_config)
+        is_quantized_model = is_quantized_model_config(actor_model_config)
+        is_qlora = is_qlora_mode(self._is_lora, actor_model_config)
+        if role == "actor":
+            self._is_qlora = is_qlora
+
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
@@ -380,6 +397,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
+                **quantized_model_init_kwargs,
             )
 
             # Apply Liger kernel to the model if use_liger is set to True
@@ -401,14 +419,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
-            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
-            actor_module.to(torch_dtype)
+            # Preserve quantized weights when loading quantized checkpoints.
+            if not is_quantized_model:
+                # some parameters may not in torch_dtype. TODO: remove this after we switch to fsdp2
+                actor_module.to(torch_dtype)
+            elif self.rank == 0:
+                print(f"Detected quantized {role} model. Skipping module.to({torch_dtype}).")
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if self._is_lora:
             print("Applying LoRA to actor module")
+            if is_qlora:
+                actor_module, used_prepare_kbit = maybe_prepare_model_for_qlora(
+                    actor_module,
+                    enable_gradient_checkpointing=enable_gradient_checkpointing,
+                    logger=logger,
+                )
+                if used_prepare_kbit and self.rank == 0:
+                    print(f"Applied `prepare_model_for_kbit_training` for {role} module.")
+                patched = attach_weight_proxies_for_qlora(actor_module, logger=logger)
+                if patched > 0 and self.rank == 0:
+                    print(f"Attached weight proxies for {patched} modules before PEFT injection ({role}).")
             actor_module.enable_input_require_grads()
 
             lora_adapter_path = self.config.model.get("lora_adapter_path")
@@ -420,7 +453,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # Copy adapter to local if needed
                 local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
 
-                actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                try:
+                    actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                except Exception as exc:
+                    recovered = False
+                    if is_qlora and is_missing_weight_attr_error(exc):
+                        patched = attach_weight_proxies_for_qlora(actor_module, logger=logger)
+                        if patched > 0:
+                            actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                            recovered = True
+                    if not recovered:
+                        if is_qlora and is_peft_lora_injection_error(exc):
+                            raise RuntimeError(
+                                "Failed to inject LoRA adapter into quantized base model. "
+                                "This usually means PEFT does not support the checkpoint's quantized linear class."
+                            ) from exc
+                        raise
                 peft_config = actor_module.peft_config["default"]
                 # Ensure task_type is TaskType enum, not string
                 if isinstance(peft_config.task_type, str):
@@ -436,7 +484,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                try:
+                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                except Exception as exc:
+                    recovered = False
+                    if is_qlora and is_missing_weight_attr_error(exc):
+                        patched = attach_weight_proxies_for_qlora(actor_module, logger=logger)
+                        if patched > 0:
+                            actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                            recovered = True
+                    if not recovered:
+                        if is_qlora and is_peft_lora_injection_error(exc):
+                            raise RuntimeError(
+                                "Failed to apply LoRA on quantized base model. "
+                                "This usually means PEFT does not support the checkpoint's quantized linear class."
+                            ) from exc
+                        raise
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -637,6 +700,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         # used for LoRA
+        if self._is_qlora:
+            validate_rollout_load_format_for_qlora(self.config.rollout.load_format)
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
 
@@ -1213,6 +1278,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         self._is_lora = (
             self.config.model.get("lora_adapter_path") is not None or self.config.model.get("lora_rank", 0) > 0
         )
+        self._is_qlora = False
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
     def _build_critic_model_optimizer(self, config):
@@ -1269,6 +1335,11 @@ class CriticWorker(Worker, DistProfilerExtension):
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
 
+        quantized_model_init_kwargs = get_quantization_model_init_kwargs(critic_model_config)
+        is_quantized_model = is_quantized_model_config(critic_model_config)
+        is_qlora = is_qlora_mode(self._is_lora, critic_model_config)
+        self._is_qlora = is_qlora
+
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not critic_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
@@ -1284,6 +1355,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 torch_dtype,
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
+                model_init_kwargs=quantized_model_init_kwargs,
             )
 
             use_remove_padding = config.model.get("use_remove_padding", False)
@@ -1294,14 +1366,29 @@ class CriticWorker(Worker, DistProfilerExtension):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
             )
 
-            # some parameters may not in torch_dtype
-            critic_module.to(torch_dtype)
+            # Preserve quantized weights when loading quantized checkpoints.
+            if not is_quantized_model:
+                # some parameters may not in torch_dtype
+                critic_module.to(torch_dtype)
+            elif self.rank == 0:
+                print(f"Detected quantized critic model. Skipping module.to({torch_dtype}).")
 
             if config.model.get("enable_gradient_checkpointing", False):
                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if self._is_lora:
             print("Applying LoRA to critic module")
+            if is_qlora:
+                critic_module, used_prepare_kbit = maybe_prepare_model_for_qlora(
+                    critic_module,
+                    enable_gradient_checkpointing=config.model.get("enable_gradient_checkpointing", False),
+                    logger=logger,
+                )
+                if used_prepare_kbit and self.rank == 0:
+                    print("Applied `prepare_model_for_kbit_training` for critic module.")
+                patched = attach_weight_proxies_for_qlora(critic_module, logger=logger)
+                if patched > 0 and self.rank == 0:
+                    print(f"Attached weight proxies for {patched} modules before PEFT injection (critic).")
             critic_module.enable_input_require_grads()
 
             # Check if we should load a pre-trained LoRA adapter
@@ -1314,7 +1401,24 @@ class CriticWorker(Worker, DistProfilerExtension):
                 # Copy adapter to local if needed
                 local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
 
-                critic_module = PeftModel.from_pretrained(critic_module, local_adapter_path, is_trainable=True)
+                try:
+                    critic_module = PeftModel.from_pretrained(critic_module, local_adapter_path, is_trainable=True)
+                except Exception as exc:
+                    recovered = False
+                    if is_qlora and is_missing_weight_attr_error(exc):
+                        patched = attach_weight_proxies_for_qlora(critic_module, logger=logger)
+                        if patched > 0:
+                            critic_module = PeftModel.from_pretrained(
+                                critic_module, local_adapter_path, is_trainable=True
+                            )
+                            recovered = True
+                    if not recovered:
+                        if is_qlora and is_peft_lora_injection_error(exc):
+                            raise RuntimeError(
+                                "Failed to inject LoRA adapter into quantized critic base model. "
+                                "This usually means PEFT does not support the checkpoint's quantized linear class."
+                            ) from exc
+                        raise
                 peft_config = critic_module.peft_config["default"]
                 # Ensure task_type is TaskType enum, not string
                 if isinstance(peft_config.task_type, str):
@@ -1329,7 +1433,22 @@ class CriticWorker(Worker, DistProfilerExtension):
                     "target_modules": convert_to_regular_types(self.config.model.target_modules),
                     "bias": "none",
                 }
-                critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
+                try:
+                    critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
+                except Exception as exc:
+                    recovered = False
+                    if is_qlora and is_missing_weight_attr_error(exc):
+                        patched = attach_weight_proxies_for_qlora(critic_module, logger=logger)
+                        if patched > 0:
+                            critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
+                            recovered = True
+                    if not recovered:
+                        if is_qlora and is_peft_lora_injection_error(exc):
+                            raise RuntimeError(
+                                "Failed to apply LoRA on quantized critic base model. "
+                                "This usually means PEFT does not support the checkpoint's quantized linear class."
+                            ) from exc
+                        raise
 
         if self.rank == 0:
             print_model_size(critic_module)
