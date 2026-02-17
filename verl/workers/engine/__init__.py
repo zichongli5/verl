@@ -28,6 +28,8 @@ try:
     from .megatron import MegatronEngine, MegatronEngineWithLMHead
 
     __all__ += ["MegatronEngine", "MegatronEngineWithLMHead"]
-except ImportError:
+except Exception:
+    # Megatron can fail at import time due to optional CUDA/JIT extensions.
+    # Keep non-Megatron paths usable (e.g., FSDP training).
     MegatronEngine = None
     MegatronEngineWithLMHead = None

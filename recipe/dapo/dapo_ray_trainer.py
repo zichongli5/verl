@@ -391,6 +391,13 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Log training accuracy when reward manager returns per-sample `acc`.
+                if "acc" in batch.non_tensor_batch:
+                    train_acc = np.asarray(batch.non_tensor_batch["acc"], dtype=np.float32)
+                    if train_acc.size > 0:
+                        metrics["train/acc_mean"] = float(np.mean(train_acc))
+                        metrics["train/acc_max"] = float(np.max(train_acc))
+                        metrics["train/acc_min"] = float(np.min(train_acc))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7B-Base-processed'
+exp_name=${EXP_NAME:-"DAPO-KimiLinear-48B-debug-shortctx"}
 
 adv_estimator=grpo
 
@@ -14,26 +14,22 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
+# Debug-first defaults for large Kimi-Linear model (override via env vars).
+max_prompt_length=${MAX_PROMPT_LENGTH:-256}
+max_response_length=${MAX_RESPONSE_LENGTH:-256}
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=${OVERLONG_BUFFER_LEN:-$((max_response_length))}
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
-train_prompt_bsz=16
-gen_prompt_bsz=$((train_prompt_bsz * 3))
-n_resp_per_prompt=16
-train_prompt_mini_bsz=1
-
-# Optimizer (override through env vars).
-actor_optimizer=${ACTOR_OPTIMIZER:-"AdamW"}
-actor_optimizer_impl=${ACTOR_OPTIMIZER_IMPL:-"torch.optim"}
-actor_optim_betas=${ACTOR_OPTIM_BETAS:-"[0.9,0.999]"}
+max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-2}
+train_prompt_bsz=${TRAIN_PROMPT_BSZ:-1}
+gen_prompt_bsz=${GEN_PROMPT_BSZ:-$((train_prompt_bsz * 2))}
+n_resp_per_prompt=${N_RESP_PER_PROMPT:-2}
+train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-1}
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -42,10 +38,12 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/mnt/main_storage/qerl"}
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
+MODEL_PATH=${MODEL_PATH:-"moonshotai/Kimi-Linear-48B-A3B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k-processed_swapped.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+# Required for models with custom modeling/tokenizer code on Hugging Face.
+trust_remote_code=${TRUST_REMOTE_CODE:-true}
 # PROMPT_KEY=${PROMPT_KEY:-"source_prompt"}
 
 # Algorithm
@@ -55,12 +53,12 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=4
+sp_size=8
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 offload=True
-gen_tp=1
+gen_tp=8
 
 ray job submit --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -68,6 +66,7 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
+    data.trust_remote_code=${trust_remote_code} \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -93,10 +92,8 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.optimizer="${actor_optimizer}" \
-    actor_rollout_ref.actor.optim.optimizer_impl="${actor_optimizer_impl}" \
-    actor_rollout_ref.actor.optim.betas="${actor_optim_betas}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
@@ -137,5 +134,4 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     trainer.save_freq=50 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=auto \
-    "$@"
+    trainer.resume_mode=auto
