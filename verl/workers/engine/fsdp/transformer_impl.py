@@ -431,7 +431,7 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        optimizer = build_optimizer(module.named_parameters(), self.optimizer_config)
 
         return optimizer
 

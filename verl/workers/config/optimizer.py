@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import warnings
 from dataclasses import dataclass
 from typing import Optional
 
-from omegaconf import MISSING
+import torch
+from omegaconf import MISSING, OmegaConf
 
 from verl.base_config import BaseConfig
 
@@ -120,6 +122,139 @@ class McoreOptimizerConfig(OptimizerConfig):
     override_optimizer_config: Optional[dict] = None
 
 
+class CompositeOptimizer(torch.optim.Optimizer):
+    """A thin wrapper that steps multiple optimizers together."""
+
+    def __init__(self, optimizers: list[torch.optim.Optimizer]):
+        if len(optimizers) == 0:
+            raise ValueError("`optimizers` must not be empty.")
+        self.optimizers = optimizers
+        # `Optimizer` requires a valid parameter list for initialization.
+        super().__init__(optimizers[0].param_groups, defaults={})
+        self._rebuild_views()
+
+    def _rebuild_views(self):
+        self.param_groups = []
+        self.state = {}
+        for optimizer in self.optimizers:
+            self.param_groups.extend(optimizer.param_groups)
+            self.state.update(optimizer.state)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = self.optimizers[0].step(closure=closure)
+        for optimizer in self.optimizers[1:]:
+            optimizer.step()
+        self._rebuild_views()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {
+            "composite_optimizer": True,
+            "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+        }
+
+    def load_state_dict(self, state_dict):
+        # Backward compatibility: allow loading a single optimizer state dict.
+        if isinstance(state_dict, dict) and state_dict.get("composite_optimizer", False):
+            optimizer_state_dicts = state_dict.get("optimizers", [])
+            if len(optimizer_state_dicts) != len(self.optimizers):
+                raise ValueError(
+                    f"Expected {len(self.optimizers)} optimizer state dicts, got {len(optimizer_state_dicts)}."
+                )
+            for optimizer, optimizer_state_dict in zip(self.optimizers, optimizer_state_dicts, strict=True):
+                optimizer.load_state_dict(optimizer_state_dict)
+        else:
+            self.optimizers[0].load_state_dict(state_dict)
+        self._rebuild_views()
+
+
+def _to_python_dict(obj):
+    if obj is None:
+        return None
+    if OmegaConf.is_config(obj):
+        return OmegaConf.to_container(obj, resolve=True)
+    return dict(obj)
+
+
+def _build_optimizer_args(
+    optimizer_name: str,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float],
+    override_config: Optional[dict],
+):
+    optimizer_args = {"lr": lr, "weight_decay": weight_decay}
+    optimizer_name_lower = optimizer_name.lower()
+    if "adam" in optimizer_name_lower or "ademamix" in optimizer_name_lower:
+        optimizer_args["betas"] = tuple(betas)
+    if override_config is not None:
+        optimizer_args.update(override_config)
+    return optimizer_args
+
+
+def _load_optimizer_cls(optimizer_impl: str, optimizer_name: str):
+    import importlib
+
+    try:
+        module = importlib.import_module(optimizer_impl)
+        optimizer_cls = getattr(module, optimizer_name)
+        return optimizer_cls, module
+    except ImportError as e:
+        raise ImportError(
+            f"Failed to import module '{optimizer_impl}'. Make sure the package is installed. Error: {e}"
+        ) from e
+    except AttributeError as e:
+        raise AttributeError(
+            f"Optimizer '{optimizer_name}' not found in module '{optimizer_impl}'. "
+            f"Available optimizers: {dir(module)}"
+        ) from e
+
+
+def _match_patterns(name: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, name) is not None for pattern in patterns)
+
+
+def _split_muon_and_non_muon_params(named_parameters: list[tuple[str, torch.nn.Parameter]], group_cfg: dict):
+    include_patterns = list(group_cfg.get("muon_include_patterns", []))
+    exclude_patterns = list(group_cfg.get("muon_exclude_patterns", []))
+
+    muon_params = []
+    non_muon_params = []
+
+    for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
+
+        use_muon = param.ndim >= 2
+        if use_muon and include_patterns:
+            use_muon = _match_patterns(name, include_patterns)
+        if use_muon and exclude_patterns and _match_patterns(name, exclude_patterns):
+            use_muon = False
+
+        if use_muon:
+            muon_params.append(param)
+        else:
+            non_muon_params.append(param)
+
+    return muon_params, non_muon_params
+
+
+def _normalize_named_parameters(parameters):
+    named_parameters = []
+    for index, item in enumerate(parameters):
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str):
+            name, param = item
+        else:
+            name, param = f"param_{index}", item
+        named_parameters.append((name, param))
+    return named_parameters
+
+
 def build_optimizer(parameters, config: FSDPOptimizerConfig):
     """Build an optimizer based on the configuration.
 
@@ -146,31 +281,89 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
         config.optimizer_impl = "bitsandbytes.optim"
         config.optimizer = "AdamW8bit"
     """
-    import importlib
+    named_parameters = _normalize_named_parameters(parameters)
+    optimizer_override = _to_python_dict(config.override_optimizer_config) or {}
+    group_cfg = _to_python_dict(optimizer_override.pop("optimizer_group_config", None))
 
-    optimizer_args = {
-        "lr": config.lr,
-        "weight_decay": config.weight_decay,
-    }
+    optimizer_name = config.optimizer
+    optimizer_impl = config.optimizer_impl
+    optimizer_name_lower = optimizer_name.lower()
 
-    optimizer_name_lower = config.optimizer.lower()
-    if "adam" in optimizer_name_lower or "ademamix" in optimizer_name_lower:
-        optimizer_args["betas"] = config.betas
+    # Muon only supports 2D tensors. If user asks for split mode, optimize 2D tensors
+    # with Muon and the rest with a fallback optimizer (AdamW by default).
+    if optimizer_name_lower == "muon" and group_cfg is not None:
+        mode = group_cfg.get("mode", "muon_2d_adamw")
+        if mode != "muon_2d_adamw":
+            raise ValueError(
+                f"Unsupported optimizer_group_config.mode={mode!r}. Only 'muon_2d_adamw' is supported currently."
+            )
 
-    if config.override_optimizer_config is not None:
-        optimizer_args.update(config.override_optimizer_config)
+        muon_params, non_muon_params = _split_muon_and_non_muon_params(named_parameters, group_cfg)
+        if len(muon_params) == 0:
+            n_trainable = sum(1 for _, param in named_parameters if param.requires_grad)
+            n_trainable_2d = sum(1 for _, param in named_parameters if param.requires_grad and param.ndim == 2)
+            raise ValueError(
+                "No parameters selected for Muon. "
+                f"trainable={n_trainable}, trainable_2d={n_trainable_2d}. "
+                "Adjust include/exclude patterns or model selection. "
+                "If using FSDP with flattened params, set "
+                "`actor_rollout_ref.actor.fsdp_config.use_orig_params=True`."
+            )
 
-    try:
-        module = importlib.import_module(config.optimizer_impl)
-        optimizer_cls = getattr(module, config.optimizer)
-    except ImportError as e:
-        raise ImportError(
-            f"Failed to import module '{config.optimizer_impl}'. Make sure the package is installed. Error: {e}"
-        ) from e
-    except AttributeError as e:
-        raise AttributeError(
-            f"Optimizer '{config.optimizer}' not found in module '{config.optimizer_impl}'. "
-            f"Available optimizers: {dir(module)}"
-        ) from e
+        muon_group_overrides = _to_python_dict(group_cfg.get("muon_group_overrides", {})) or {}
+        muon_group = [{"params": muon_params, **muon_group_overrides}]
 
-    return optimizer_cls(parameters, **optimizer_args)
+        muon_optimizer_args = _build_optimizer_args(
+            optimizer_name=optimizer_name,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=config.betas,
+            override_config=optimizer_override,
+        )
+        muon_optimizer_cls, _ = _load_optimizer_cls(optimizer_impl=optimizer_impl, optimizer_name=optimizer_name)
+        muon_optimizer = muon_optimizer_cls(muon_group, **muon_optimizer_args)
+
+        if len(non_muon_params) == 0:
+            return muon_optimizer
+
+        non_muon_optimizer_name = group_cfg.get("non_muon_optimizer", "AdamW")
+        non_muon_optimizer_impl = group_cfg.get("non_muon_optimizer_impl", "torch.optim")
+        non_muon_override = _to_python_dict(group_cfg.get("non_muon_override_optimizer_config", {})) or {}
+        non_muon_betas = tuple(group_cfg.get("non_muon_betas", config.betas))
+        non_muon_lr = float(group_cfg.get("non_muon_lr", config.lr))
+        non_muon_weight_decay = float(group_cfg.get("non_muon_weight_decay", config.weight_decay))
+        non_muon_group_overrides = _to_python_dict(group_cfg.get("non_muon_group_overrides", {})) or {}
+        non_muon_group = [{"params": non_muon_params, **non_muon_group_overrides}]
+
+        non_muon_optimizer_args = _build_optimizer_args(
+            optimizer_name=non_muon_optimizer_name,
+            lr=non_muon_lr,
+            weight_decay=non_muon_weight_decay,
+            betas=non_muon_betas,
+            override_config=non_muon_override,
+        )
+        non_muon_optimizer_cls, _ = _load_optimizer_cls(
+            optimizer_impl=non_muon_optimizer_impl, optimizer_name=non_muon_optimizer_name
+        )
+        non_muon_optimizer = non_muon_optimizer_cls(non_muon_group, **non_muon_optimizer_args)
+
+        return CompositeOptimizer([muon_optimizer, non_muon_optimizer])
+
+    base_parameters = [param for _, param in named_parameters]
+    if optimizer_name_lower == "muon":
+        invalid_muon_params = [name for name, param in named_parameters if param.requires_grad and param.ndim != 2]
+        if invalid_muon_params:
+            raise ValueError(
+                "Muon only supports 2D parameters. Configure split mode with:\n"
+                "+actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_group_config.mode=muon_2d_adamw"
+            )
+
+    optimizer_args = _build_optimizer_args(
+        optimizer_name=optimizer_name,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=config.betas,
+        override_config=optimizer_override,
+    )
+    optimizer_cls, _ = _load_optimizer_cls(optimizer_impl=optimizer_impl, optimizer_name=optimizer_name)
+    return optimizer_cls(base_parameters, **optimizer_args)

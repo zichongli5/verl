@@ -95,6 +95,7 @@ from verl.utils.qlora import (
     validate_rollout_load_format_for_qlora,
 )
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.transformers_compat import patch_transformers_auto_docstring_uniontype
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
@@ -302,6 +303,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
+
+        patch_transformers_auto_docstring_uniontype()
 
         assert role in ["actor", "ref"]
 
@@ -603,7 +606,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            actor_named_parameters = list(actor_module_fsdp.named_parameters())
+            if str(optim_config.get("optimizer", "")).lower() == "muon" and os.getenv("MUON_DEBUG", "0") == "1":
+                ndim_hist = {}
+                for _, param in actor_named_parameters:
+                    if not param.requires_grad:
+                        continue
+                    ndim_hist[param.ndim] = ndim_hist.get(param.ndim, 0) + 1
+                preview = [
+                    (name, tuple(param.shape), param.requires_grad) for name, param in actor_named_parameters[:12]
+                ]
+                print(
+                    "[MUON_DEBUG] "
+                    f"strategy={fsdp_strategy} use_orig_params={self.use_orig_params} "
+                    f"fsdp_size={fsdp_config.get('fsdp_size', None)} "
+                    f"trainable_ndim_hist={ndim_hist} preview={preview}"
+                )
+
+            actor_optimizer = build_optimizer(actor_named_parameters, optim_config)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -1536,7 +1556,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
-        critic_optimizer = build_optimizer(critic_module.parameters(), config.optim)
+        critic_optimizer = build_optimizer(critic_module.named_parameters(), config.optim)
 
         total_steps = config.optim.get("total_training_steps", 0)
         num_warmup_steps = int(config.optim.get("lr_warmup_steps", -1))

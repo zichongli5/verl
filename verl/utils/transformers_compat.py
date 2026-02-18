@@ -17,6 +17,7 @@ Compatibility utilities for different versions of transformers library.
 """
 
 import importlib.metadata
+import types
 from functools import lru_cache
 from typing import Optional
 
@@ -55,3 +56,45 @@ def is_transformers_version_in_range(min_version: Optional[str] = None, max_vers
         upper_bound_check = transformers_version <= version.parse(max_version)
 
     return lower_bound_check and upper_bound_check
+
+
+def patch_transformers_auto_docstring_uniontype() -> bool:
+    """
+    Patch transformers auto_docstring for Python 3.10+ ``types.UnionType`` annotations.
+
+    Some transformers versions build parameter type strings using ``annotation.__name__``.
+    This fails for ``A | B`` annotations because ``types.UnionType`` does not expose
+    ``__name__`` and raises ``AttributeError`` while importing remote model code.
+    """
+    union_type = getattr(types, "UnionType", None)
+    if union_type is None:
+        return False
+
+    try:
+        from transformers.utils import auto_docstring as auto_docstring_module
+    except ImportError:
+        return False
+
+    original = getattr(auto_docstring_module, "_process_parameter_type", None)
+    if original is None or getattr(original, "_verl_uniontype_patch", False):
+        return False
+
+    def _patched_process_parameter_type(param, param_name, func):
+        try:
+            return original(param, param_name, func)
+        except AttributeError as exc:
+            annotation = getattr(param, "annotation", None)
+            if not (isinstance(annotation, union_type) and "__name__" in str(exc)):
+                raise
+
+            param_type = str(annotation).replace("transformers.", "~")
+            optional = "None" in param_type or "NoneType" in param_type
+            for none_marker in ("NoneType | ", "None | ", " | NoneType", " | None"):
+                param_type = param_type.replace(none_marker, "")
+            if optional:
+                param_type = f"Optional[{param_type}]"
+            return param_type, optional
+
+    _patched_process_parameter_type._verl_uniontype_patch = True
+    auto_docstring_module._process_parameter_type = _patched_process_parameter_type
+    return True

@@ -46,7 +46,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/mnt/main_storage/qerl"}
-MODEL_PATH=${MODEL_PATH:-"/mnt/main_storage/qerl/qmodel/Qwen2.5-7B-NVFP4A16-GPTQ/"}
+MODEL_PATH=${MODEL_PATH:-"/mnt/main_storage/qerl/qmodel/Qwen2.5-7B-NVFP4A16-GPTQ"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k-processed_swapped.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}

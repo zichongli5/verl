@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7B-Base-QLoRA-r32-a32-LoftQInit'
+exp_name=${EXP_NAME:-"DAPO-Qwen3-Next-80B-debug-shortctx"}
 
 adv_estimator=grpo
 
@@ -14,26 +14,22 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
+# Debug-first defaults for large Kimi-Linear model (override via env vars).
+max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
+max_response_length=${MAX_RESPONSE_LENGTH:-256}
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=${OVERLONG_BUFFER_LEN:-$((max_response_length))}
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
-train_prompt_bsz=16
-gen_prompt_bsz=$((train_prompt_bsz * 3))
-n_resp_per_prompt=16
-train_prompt_mini_bsz=1
-
-# QLoRA
-LORA_RANK=${LORA_RANK:-32}
-LORA_ALPHA=${LORA_ALPHA:-32}
-LORA_ADAPTER_PATH=${LORA_ADAPTER_PATH:-"/mnt/main_storage/qerl/qmodel/Qwen2.5-7B-Instruct-LoftQ-Iterative/iteration_0/lora_adapters/aligned/"}
+max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-2}
+train_prompt_bsz=${TRAIN_PROMPT_BSZ:-1}
+gen_prompt_bsz=${GEN_PROMPT_BSZ:-$((train_prompt_bsz * 2))}
+n_resp_per_prompt=${N_RESP_PER_PROMPT:-2}
+train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-1}
 
 # Optimizer (override through env vars).
 actor_optimizer=${ACTOR_OPTIMIZER:-"AdamW"}
@@ -47,10 +43,13 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/mnt/main_storage/qerl"}
-MODEL_PATH=${MODEL_PATH:-"/mnt/main_storage/qerl/qmodel/Qwen2.5-7B-NVFP4A16-GPTQ"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-Next-80B-A3B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k-processed_swapped.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/main_storage/qerl/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+# Required for models with custom modeling/tokenizer code on Hugging Face.
+trust_remote_code=${TRUST_REMOTE_CODE:-true}
+# PROMPT_KEY=${PROMPT_KEY:-"source_prompt"}
 
 # Algorithm
 temperature=1.0
@@ -59,12 +58,12 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=4
+sp_size=8
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 offload=True
-gen_tp=1
+gen_tp=8
 
 ray job submit --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -72,6 +71,7 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
+    data.trust_remote_code=${trust_remote_code} \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -90,17 +90,15 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.model.lora_rank=${LORA_RANK} \
-    actor_rollout_ref.model.lora_alpha=${LORA_ALPHA} \
-    actor_rollout_ref.model.lora_adapter_path="${LORA_ADAPTER_PATH}" \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.optimizer="${actor_optimizer}" \
     actor_rollout_ref.actor.optim.optimizer_impl="${actor_optimizer_impl}" \
     actor_rollout_ref.actor.optim.betas="${actor_optim_betas}" \
@@ -114,8 +112,6 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.load_format=auto \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -128,6 +124,7 @@ ray job submit --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \

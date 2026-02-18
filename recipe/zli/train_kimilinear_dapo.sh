@@ -15,7 +15,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # Debug-first defaults for large Kimi-Linear model (override via env vars).
-max_prompt_length=${MAX_PROMPT_LENGTH:-256}
+max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
 max_response_length=${MAX_RESPONSE_LENGTH:-256}
 enable_overlong_buffer=True
 overlong_buffer_len=${OVERLONG_BUFFER_LEN:-$((max_response_length))}

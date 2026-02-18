@@ -219,7 +219,7 @@ class PRIMERewardModelWorker(Worker):
             cpu_offload=None,
         )
 
-        reward_optimizer = build_optimizer(reward_module.parameters(), config.model.optim)
+        reward_optimizer = build_optimizer(reward_module.named_parameters(), config.model.optim)
 
         total_steps = config.model.optim.get("total_training_steps", 0)
         num_warmup_steps = int(config.model.optim.get("lr_warmup_steps", -1))
