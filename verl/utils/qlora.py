@@ -70,6 +70,19 @@ def get_quantization_model_init_kwargs(model_config: Any) -> dict[str, Any]:
     quantization_config_dict = _to_dict_if_possible(quantization_config)
     if quantization_config_dict is not None and len(quantization_config_dict) == 0:
         return {}
+    # HF can store quantization_config as a plain dict on AutoConfig.
+    # from_pretrained expects a QuantizationConfigMixin instance here when the model
+    # config resolves to a concrete quantization config class (e.g. CompressedTensorsConfig).
+    # Normalize dict -> class instance to avoid class-mismatch errors.
+    if isinstance(quantization_config, dict):
+        try:
+            from transformers.quantizers.auto import AutoQuantizationConfig
+
+            quantization_config = AutoQuantizationConfig.from_dict(quantization_config)
+        except Exception:
+            # Best effort: keep original behavior if transformers quantization APIs
+            # are unavailable or the dict is from an unsupported/custom method.
+            pass
     return {"quantization_config": quantization_config}
 
 

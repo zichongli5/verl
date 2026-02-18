@@ -65,7 +65,6 @@ from verl.utils.model import convert_weight_keys
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.qlora import (
     attach_weight_proxies_for_qlora,
-    get_quantization_model_init_kwargs,
     is_missing_weight_attr_error,
     is_peft_lora_injection_error,
     is_qlora_mode,
@@ -212,7 +211,6 @@ class FSDPEngine(BaseEngine):
             warnings.simplefilter("ignore")
 
             auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
-            quantized_model_init_kwargs = get_quantization_model_init_kwargs(self.model_config.hf_config)
             is_quantized_model = is_quantized_model_config(self.model_config.hf_config)
 
             module = auto_class.from_pretrained(
@@ -220,7 +218,6 @@ class FSDPEngine(BaseEngine):
                 torch_dtype=torch_dtype,
                 config=self.model_config.hf_config,
                 trust_remote_code=self.model_config.trust_remote_code,
-                **quantized_model_init_kwargs,
             )
 
             use_liger = self.model_config.use_liger

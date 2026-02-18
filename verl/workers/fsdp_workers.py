@@ -86,7 +86,6 @@ from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.qlora import (
     attach_weight_proxies_for_qlora,
-    get_quantization_model_init_kwargs,
     is_missing_weight_attr_error,
     is_peft_lora_injection_error,
     is_qlora_mode,
@@ -355,7 +354,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
-        quantized_model_init_kwargs = get_quantization_model_init_kwargs(actor_model_config)
         is_quantized_model = is_quantized_model_config(actor_model_config)
         is_qlora = is_qlora_mode(self._is_lora, actor_model_config)
         if role == "actor":
@@ -400,7 +398,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
-                **quantized_model_init_kwargs,
             )
 
             # Apply Liger kernel to the model if use_liger is set to True
@@ -1355,7 +1352,6 @@ class CriticWorker(Worker, DistProfilerExtension):
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
 
-        quantized_model_init_kwargs = get_quantization_model_init_kwargs(critic_model_config)
         is_quantized_model = is_quantized_model_config(critic_model_config)
         is_qlora = is_qlora_mode(self._is_lora, critic_model_config)
         self._is_qlora = is_qlora
@@ -1375,7 +1371,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                 torch_dtype,
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
-                model_init_kwargs=quantized_model_init_kwargs,
             )
 
             use_remove_padding = config.model.get("use_remove_padding", False)
